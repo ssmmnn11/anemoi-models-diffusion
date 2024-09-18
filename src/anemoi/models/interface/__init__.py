@@ -195,7 +195,7 @@ class AnemoiModelInterface(torch.nn.Module):
 
         return state_outp
 
-    def compute_tendency(self, x_t1, x_t0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def compute_tendency(self, x_t1: torch.Tensor, x_t0: torch.Tensor) -> torch.Tensor:
         tendency = self.pre_processors_tendency(
             x_t1[..., self.data_indices.data.output.full] - x_t0[..., self.data_indices.data.output.full],
             in_place=False,
