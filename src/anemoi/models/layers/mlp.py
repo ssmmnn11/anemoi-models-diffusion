@@ -14,11 +14,12 @@ from torch import nn
 
 from anemoi.models.layers.utils import AutocastLayerNorm
 from anemoi.models.layers.utils import CheckpointWrapper
+from anemoi.models.layers.utils import ConditionalLayerNorm
 
 LOGGER = logging.getLogger(__name__)
 
 
-class MLP(nn.Module):
+class MLP1(nn.Module):
     """Multi-layer perceptron with optional checkpoint."""
 
     def __init__(
@@ -86,3 +87,56 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
+
+
+class MLP(nn.Module):
+    """Multi-layer perceptron with conditional layer norm."""
+
+    def __init__(
+        self,
+        in_features: int,
+        hidden_dim: int,
+        out_features: int,
+        n_extra_layers: int = 0,
+        activation: str = "SiLU",
+        initial_layer_norm: bool = False,
+        final_layer_norm: bool = True,
+        final_activation: bool = False,
+    ) -> None:
+        super().__init__()
+
+        try:
+            act_func = getattr(nn, activation)
+        except AttributeError as ae:
+            LOGGER.error("Activation function %s not supported", activation)
+            raise RuntimeError from ae
+
+        self.mlp = nn.Sequential(nn.Linear(in_features, hidden_dim), act_func())
+        for _ in range(n_extra_layers + 1):
+            self.mlp.append(nn.Linear(hidden_dim, hidden_dim))
+            self.mlp.append(act_func())
+        self.mlp.append(nn.Linear(hidden_dim, out_features))
+
+        if final_activation:
+            self.mlp.append(act_func())
+
+        self.final_layer_norm = final_layer_norm
+        self.initial_layer_norm = initial_layer_norm
+
+        assert not (
+            self.final_layer_norm is True and self.initial_layer_norm is True
+        ), "Only either initial or final layer norm supported, not both."
+
+        if initial_layer_norm or final_layer_norm:
+            self.norm = ConditionalLayerNorm(out_features)
+
+    def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
+        if self.initial_layer_norm:
+            x = self.norm(x, emb)
+
+        x = self.mlp(x)
+
+        if self.final_layer_norm:
+            x = self.norm(x, emb)
+
+        return x

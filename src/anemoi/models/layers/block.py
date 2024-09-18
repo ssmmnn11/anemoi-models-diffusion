@@ -29,6 +29,7 @@ from anemoi.models.layers.attention import MultiHeadSelfAttention
 from anemoi.models.layers.conv import GraphConv
 from anemoi.models.layers.conv import GraphTransformerConv
 from anemoi.models.layers.mlp import MLP
+from anemoi.models.layers.utils import ConditionalLayerNorm
 
 LOGGER = logging.getLogger(__name__)
 
@@ -66,13 +67,7 @@ class TransformerProcessorBlock(BaseBlock):
     ):
         super().__init__()
 
-        try:
-            act_func = getattr(nn, activation)
-        except AttributeError as ae:
-            LOGGER.error("Activation function %s not supported", activation)
-            raise RuntimeError from ae
-
-        self.layer_norm1 = nn.LayerNorm(num_channels)
+        self.layer_norm1 = ConditionalLayerNorm(num_channels)
 
         self.attention = MultiHeadSelfAttention(
             num_heads=num_heads,
@@ -83,19 +78,22 @@ class TransformerProcessorBlock(BaseBlock):
             dropout_p=dropout_p,
         )
 
-        self.mlp = nn.Sequential(
-            nn.Linear(num_channels, hidden_dim),
-            act_func(),
-            nn.Linear(hidden_dim, num_channels),
+        self.mlp = MLP(
+            num_channels,
+            hidden_dim,
+            num_channels,
+            n_extra_layers=-1,
+            activation=activation,
+            initial_layer_norm=True,
+            final_layer_norm=False,
         )
-        self.layer_norm2 = nn.LayerNorm(num_channels)
 
     def forward(
-        self, x: Tensor, shapes: list, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
+        self, x: Tensor, shapes: list, noise_level, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
     ) -> Tensor:
         # Need to be out of place for gradient propagation
-        x = x + self.attention(self.layer_norm1(x), shapes, batch_size, model_comm_group=model_comm_group)
-        x = x + self.mlp(self.layer_norm2(x))
+        x = x + self.attention(self.layer_norm1(x, noise_level), shapes, batch_size, model_comm_group=model_comm_group)
+        x = x + self.mlp(x, noise_level)
         return x
 
 
@@ -334,27 +332,27 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
 
         self.projection = nn.Linear(out_channels, out_channels)
 
-        try:
-            act_func = getattr(nn, activation)
-        except AttributeError as ae:
-            LOGGER.error("Activation function %s not supported", activation)
-            raise RuntimeError from ae
-
-        self.node_dst_mlp = nn.Sequential(
-            nn.LayerNorm(out_channels),
-            nn.Linear(out_channels, hidden_dim),
-            act_func(),
-            nn.Linear(hidden_dim, out_channels),
+        self.node_dst_mlp = MLP(
+            out_channels,
+            hidden_dim,
+            out_channels,
+            n_extra_layers=-1,
+            activation=activation,
+            initial_layer_norm=True,
+            final_layer_norm=False,
         )
 
-        self.layer_norm1 = nn.LayerNorm(in_channels)
+        self.layer_norm1 = ConditionalLayerNorm(in_channels)
 
         if self.update_src_nodes:
-            self.node_src_mlp = nn.Sequential(
-                nn.LayerNorm(out_channels),
-                nn.Linear(out_channels, hidden_dim),
-                act_func(),
-                nn.Linear(hidden_dim, out_channels),
+            self.node_src_mlp = MLP(
+                out_channels,
+                hidden_dim,
+                out_channels,
+                n_extra_layers=-1,
+                activation=activation,
+                initial_layer_norm=True,
+                final_layer_norm=False,
             )
 
     def shard_qkve_heads(
@@ -414,6 +412,7 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         edge_attr: Tensor,
         edge_index: Adj,
         shapes: tuple,
+        noise_levels: OptPairTensor,
         batch_size: int,
         model_comm_group: Optional[ProcessGroup] = None,
         size: Optional[Size] = None,
@@ -468,7 +467,7 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
             **kwargs,
         )
 
-        self.layer_norm2 = nn.LayerNorm(in_channels)
+        self.layer_norm2 = ConditionalLayerNorm(in_channels)
 
     def forward(
         self,
@@ -476,6 +475,7 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
         edge_attr: Tensor,
         edge_index: Adj,
         shapes: tuple,
+        noise_levels: tuple[Tensor],
         batch_size: int,
         model_comm_group: Optional[ProcessGroup] = None,
         size: Optional[Size] = None,
@@ -483,14 +483,15 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
         x_skip = x
 
         x = (
-            self.layer_norm1(x[0]),
-            self.layer_norm2(x[1]),
+            self.layer_norm1(x[0], noise_levels[0]),
+            self.layer_norm2(x[1], noise_levels[1]),
         )  # Why does this use layer_norm2? And only is a mapper thing?
         x_r = self.lin_self(x[1])
         query = self.lin_query(x[1])
         key = self.lin_key(x[0])
         value = self.lin_value(x[0])
-        edges = self.lin_edge(edge_attr)
+        # edges = self.lin_edge2(self.edge_norm(self.lin_edge1(edge_attr), noise_levels[3]))
+        edges = self.lin_edge(edge_attr)  # we don't use the edge noise ... todo?
 
         if model_comm_group is not None:
             assert (
@@ -503,9 +504,11 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
         out = self.projection(out + x_r)
 
         out = out + x_skip[1]
-        nodes_new_dst = self.node_dst_mlp(out) + out
+        nodes_new_dst = self.node_dst_mlp(out, noise_levels[1]) + out
 
-        nodes_new_src = self.node_src_mlp(x_skip[0]) + x_skip[0] if self.update_src_nodes else x_skip[0]
+        nodes_new_src = (
+            self.node_src_mlp(x_skip[0], [noise_levels[0]]) + x_skip[0] if self.update_src_nodes else x_skip[0]
+        )
 
         nodes_new = (nodes_new_src, nodes_new_dst)
 
@@ -567,19 +570,20 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         edge_attr: Tensor,
         edge_index: Adj,
         shapes: tuple,
+        noise_levels: tuple[Tensor],
         batch_size: int,
         model_comm_group: Optional[ProcessGroup] = None,
         size: Optional[Size] = None,
     ):
         x_skip = x
 
-        x = self.layer_norm1(x)
+        x = self.layer_norm1(x, noise_levels)
         x_r = self.lin_self(x)
         query = self.lin_query(x)
         key = self.lin_key(x)
         value = self.lin_value(x)
 
-        edges = self.lin_edge(edge_attr)
+        edges = self.lin_edge(edge_attr)  # we don't use the edge noise levels ... todo?
 
         if model_comm_group is not None:
             assert (

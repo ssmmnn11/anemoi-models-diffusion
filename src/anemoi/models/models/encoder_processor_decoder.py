@@ -22,6 +22,8 @@ from torch_geometric.data import HeteroData
 
 from anemoi.models.distributed.shapes import get_shape_shards
 from anemoi.models.layers.graph import TrainableTensor
+from anemoi.models.layers.mlp import MLP1
+from anemoi.models.layers.noise import SinusoidalEmbeddings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,7 +73,12 @@ class AnemoiModelEncProcDec(nn.Module):
 
         self.num_channels = model_config.model.num_channels
 
-        input_dim = self.multi_step * self.num_input_channels + self.latlons_data.shape[1] + self.trainable_data_size
+        input_dim = (
+            self.multi_step * self.num_input_channels
+            + self.num_output_channels
+            + self.latlons_data.shape[1]
+            + self.trainable_data_size
+        )
 
         # Encoder data -> hidden
         self.encoder = instantiate(
@@ -103,6 +110,12 @@ class AnemoiModelEncProcDec(nn.Module):
             sub_graph=self._graph_data[(self._graph_name_hidden, "to", self._graph_name_data)],
             src_grid_size=self._hidden_grid_size,
             dst_grid_size=self._data_grid_size,
+        )
+
+        self.noise_embedder = SinusoidalEmbeddings(num_channels=32, max_period=1000)
+
+        self.noise_mlp = MLP1(
+            in_features=32, hidden_dim=32, out_features=16, n_extra_layers=-1, final_activation=False, layer_norm=False
         )
 
         # Instantiation of model output bounding functions (e.g., to ensure outputs like TP are positive definite)
@@ -164,6 +177,7 @@ class AnemoiModelEncProcDec(nn.Module):
         self,
         mapper: nn.Module,
         data: tuple[Tensor],
+        noise_levels: tuple[Tensor],
         batch_size: int,
         shard_shapes: tuple[tuple[int, int], tuple[int, int]],
         model_comm_group: Optional[ProcessGroup] = None,
@@ -196,19 +210,30 @@ class AnemoiModelEncProcDec(nn.Module):
             mapper,
             data,
             batch_size=batch_size,
+            noise_levels=noise_levels,
             shard_shapes=shard_shapes,
             model_comm_group=model_comm_group,
             use_reentrant=use_reentrant,
         )
 
-    def forward(self, x: Tensor, model_comm_group: Optional[ProcessGroup] = None) -> Tensor:
-        batch_size = x.shape[0]
-        ensemble_size = x.shape[2]
+    def make_noise_emb(self, noise_emb: Tensor, repeat: int) -> Tensor:
+        out = einops.repeat(
+            noise_emb, "batch ensemble noise_level vars -> batch ensemble (repeat noise_level) vars", repeat=repeat
+        )
+        out = einops.rearrange(out, "batch ensemble grid vars -> (batch ensemble grid) vars")
+        return out
 
-        # add data positional info (lat/lon)
+    def forward(
+        self, x: Tensor, state_in: Tensor, noise: Tensor, model_comm_group: Optional[ProcessGroup] = None
+    ) -> Tensor:
+        batch_size = state_in.shape[0]
+        ensemble_size = state_in.shape[2]
+
+        # combine noised target, input state and add data positional info (lat/lon)
         x_data_latent = torch.cat(
             (
-                einops.rearrange(x, "batch time ensemble grid vars -> (batch ensemble grid) (time vars)"),
+                einops.rearrange(x, "batch ensemble grid vars -> (batch ensemble grid) vars"),
+                einops.rearrange(state_in, "batch time ensemble grid vars -> (batch ensemble grid) (time vars)"),
                 self.trainable_data(self.latlons_data, batch_size=batch_size),
             ),
             dim=-1,  # feature dimension
@@ -216,23 +241,50 @@ class AnemoiModelEncProcDec(nn.Module):
 
         x_hidden_latent = self.trainable_hidden(self.latlons_hidden, batch_size=batch_size)
 
+        noise_emb = self.noise_embedder(noise)
+        noise_emb = self.noise_mlp(noise_emb)
+
+        # these are created once, we need these because we need to keep track what noise belongs to what batch
+        # in the conditional layer norms ...
+
+        noise_data = self.make_noise_emb(noise_emb, repeat=self._data_grid_size)
+        noise_hidden = self.make_noise_emb(noise_emb, repeat=self._hidden_grid_size)
+        noise_data_to_hidden = self.make_noise_emb(
+            noise_emb,
+            repeat=self._graph_data[(self._graph_name_data, "to", self._graph_name_hidden)]["edge_length"].shape[0],
+        )
+        noise_hidden_to_data = self.make_noise_emb(
+            noise_emb,
+            repeat=self._graph_data[(self._graph_name_hidden, "to", self._graph_name_data)]["edge_length"].shape[0],
+        )
+        # only GNNProcessor and GNNTransformerProcessor support noise_hidden_to_hidden
+        # noise_hidden_to_hidden = self.make_noise_emb(
+        #     noise_emb,
+        #     repeat=self._graph_data[(self._graph_name_hidden, "to", self._graph_name_hidden)]["edge_length"]
+        # )
+
         # get shard shapes
         shard_shapes_data = get_shape_shards(x_data_latent, 0, model_comm_group)
         shard_shapes_hidden = get_shape_shards(x_hidden_latent, 0, model_comm_group)
+
+        shape_noise_data = get_shape_shards(noise_data, 0, model_comm_group)
+        shape_noise_hidden = get_shape_shards(noise_hidden, 0, model_comm_group)
 
         # Run encoder
         x_data_latent, x_latent = self._run_mapper(
             self.encoder,
             (x_data_latent, x_hidden_latent),
+            noise_levels=(noise_data, noise_hidden, noise_data_to_hidden),
             batch_size=batch_size,
-            shard_shapes=(shard_shapes_data, shard_shapes_hidden),
+            shard_shapes=(shard_shapes_data, shard_shapes_hidden, shape_noise_data, shape_noise_hidden),
             model_comm_group=model_comm_group,
         )
 
         x_latent_proc = self.processor(
             x_latent,
+            noise_levels=noise_hidden,  # todo: make it work with GNNprocessor and GNNTransformerProcessor
             batch_size=batch_size,
-            shard_shapes=shard_shapes_hidden,
+            shard_shapes=(shard_shapes_hidden, shape_noise_hidden),
             model_comm_group=model_comm_group,
         )
 
@@ -243,8 +295,9 @@ class AnemoiModelEncProcDec(nn.Module):
         x_out = self._run_mapper(
             self.decoder,
             (x_latent_proc, x_data_latent),
+            noise_levels=(noise_hidden, noise_data, noise_hidden_to_data),
             batch_size=batch_size,
-            shard_shapes=(shard_shapes_hidden, shard_shapes_data),
+            shard_shapes=(shard_shapes_hidden, shard_shapes_data, shape_noise_hidden, shape_noise_data),
             model_comm_group=model_comm_group,
         )
 

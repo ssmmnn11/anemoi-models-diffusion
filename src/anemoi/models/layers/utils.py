@@ -36,3 +36,28 @@ class AutocastLayerNorm(nn.LayerNorm):
         precision.
         """
         return super().forward(x).type_as(x)
+
+
+class ConditionalLayerNorm(nn.Module):
+    def __init__(
+        self, channels: int, noise_emb_dimension: int = 16, w_one_bias_zero_init: bool = True, autocast: bool = True
+    ):
+        super().__init__()
+        # todo: make noise_emb_dimension and init strategy configurable ... how? # out = out * (scale + 1.0) + bias
+        self.norm = nn.LayerNorm(channels, elementwise_affine=False)  # no learnable parameters
+        self.scale = nn.Linear(noise_emb_dimension, channels)  # , bias=False)
+        self.bias = nn.Linear(noise_emb_dimension, channels)  # , bias=False)
+        self.autocast = autocast
+
+        if w_one_bias_zero_init:
+            nn.init.ones_(self.scale.weight)
+            nn.init.zeros_(self.scale.bias)
+            nn.init.zeros_(self.bias.weight)
+            nn.init.zeros_(self.bias.bias)
+
+    def forward(self, x: Tensor, emb: Tensor) -> Tensor:
+        scale = self.scale(emb)
+        bias = self.bias(emb)
+        out = self.norm(x)
+        out = out * (scale + 1.0) + bias
+        return out.type_as(x) if self.autocast else out

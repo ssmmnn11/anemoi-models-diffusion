@@ -146,6 +146,7 @@ class TransformerProcessor(BaseProcessor):
         x: Tensor,
         batch_size: int,
         shard_shapes: tuple[tuple[int], ...],
+        noise_levels: Tensor,
         model_comm_group: Optional[ProcessGroup] = None,
         *args,
         **kwargs,
@@ -156,7 +157,7 @@ class TransformerProcessor(BaseProcessor):
                 model_comm_group.size() == 1 or batch_size == 1
             ), "Only batch size of 1 is supported when model is sharded accross GPUs"
 
-        (x,) = self.run_layers((x,), shape_nodes, batch_size, model_comm_group)
+        (x,) = self.run_layers((x,), shape_nodes, noise_levels, batch_size, model_comm_group)
 
         return x
 

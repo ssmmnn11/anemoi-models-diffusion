@@ -105,10 +105,10 @@ class TransformerProcessorChunk(BaseProcessorChunk):
         )
 
     def forward(
-        self, x: Tensor, shapes: list, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
+        self, x: Tensor, shapes: list, noise_level, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
     ) -> Tensor:
         for i in range(self.num_layers):
-            x = self.blocks[i](x, shapes, batch_size, model_comm_group=model_comm_group)
+            x = self.blocks[i](x, shapes, noise_level, batch_size, model_comm_group=model_comm_group)
 
         return (x,)  # return tuple for consistency with other processors
 

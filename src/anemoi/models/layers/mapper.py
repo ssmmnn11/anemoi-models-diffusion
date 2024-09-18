@@ -64,7 +64,9 @@ class BaseMapper(nn.Module, ABC):
         if cpu_offload:
             self.proc = nn.ModuleList([offload_wrapper(x) for x in self.proc])
 
-    def pre_process(self, x, shard_shapes, model_comm_group=None) -> tuple[Tensor, Tensor, tuple[int], tuple[int]]:
+    def pre_process(
+        self, x, noise_levels, shard_shapes, model_comm_group=None
+    ) -> tuple[Tensor, Tensor, tuple[int], tuple[int]]:
         """Pre-processing for the Mappers.
 
         Splits the tuples into src and dst nodes and shapes as the base operation.
@@ -83,9 +85,20 @@ class BaseMapper(nn.Module, ABC):
         Tuple[Tensor, Tensor, Tuple[int], Tuple[int]]
             Source nodes, destination nodes, sharded source node shapes, sharded destination node shapes
         """
-        shapes_src, shapes_dst = shard_shapes
+        shapes_src, shapes_dst, shapes_noise_level_src, shapes_noise_level_dst = shard_shapes
         x_src, x_dst = x
-        return x_src, x_dst, shapes_src, shapes_dst
+        noise_level_src, noise_level_dst, noise_level_edges = noise_levels
+        return (
+            x_src,
+            x_dst,
+            noise_level_src,
+            noise_level_dst,
+            noise_level_edges,
+            shapes_src,
+            shapes_dst,
+            shapes_noise_level_src,
+            shapes_noise_level_dst,
+        )
 
     def post_process(self, x_dst, shapes_dst, model_comm_group=None):
         """Post-processing for the mapper."""
@@ -104,15 +117,30 @@ class BackwardMapperPostProcessMixin:
 class ForwardMapperPreProcessMixin:
     """Pre-processing for Forward Mapper from data -> hidden."""
 
-    def pre_process(self, x, shard_shapes, model_comm_group=None):
-        x_src, x_dst, shapes_src, shapes_dst = super().pre_process(x, shard_shapes, model_comm_group)
+    def pre_process(self, x, noise_levels, shard_shapes, model_comm_group=None):
+        x_src, x_dst, noise_src, noise_dst, noise_edges, shapes_src, shapes_dst, shapes_noise_src, shapes_noise_dst = (
+            super().pre_process(x, noise_levels, shard_shapes, model_comm_group)
+        )
+
         x_src = shard_tensor(x_src, 0, shapes_src, model_comm_group)
         x_dst = shard_tensor(x_dst, 0, shapes_dst, model_comm_group)
+        noise_src = shard_tensor(noise_src, 0, shapes_noise_src, model_comm_group)
+        noise_dst = shard_tensor(noise_dst, 0, shapes_noise_dst, model_comm_group)
         x_src = self.emb_nodes_src(x_src)
         x_dst = self.emb_nodes_dst(x_dst)
         shapes_src = change_channels_in_shape(shapes_src, self.hidden_dim)
         shapes_dst = change_channels_in_shape(shapes_dst, self.hidden_dim)
-        return x_src, x_dst, shapes_src, shapes_dst
+        return (
+            x_src,
+            x_dst,
+            noise_src,
+            noise_dst,
+            noise_edges,
+            shapes_src,
+            shapes_dst,
+            shapes_noise_src,
+            shapes_noise_dst,
+        )
 
 
 class GraphEdgeMixin:
@@ -245,22 +273,41 @@ class GraphTransformerBaseMapper(GraphEdgeMixin, BaseMapper):
         self,
         x: PairTensor,
         batch_size: int,
-        shard_shapes: tuple[tuple[int], tuple[int]],
+        noise_levels: PairTensor,
+        shard_shapes: tuple[tuple[int], tuple[int], tuple[int], tuple[int]],
         model_comm_group: Optional[ProcessGroup] = None,
     ) -> PairTensor:
         size = (sum(x[0] for x in shard_shapes[0]), sum(x[0] for x in shard_shapes[1]))
         edge_attr = self.trainable(self.edge_attr, batch_size)
         edge_index = self._expand_edges(self.edge_index_base, self.edge_inc, batch_size)
+
+        (
+            x_src,
+            x_dst,
+            noise_level_src,
+            noise_level_dst,
+            noise_level_edges,
+            shapes_src,
+            shapes_dst,
+            _,
+            _,
+        ) = self.pre_process(x, noise_levels, shard_shapes, model_comm_group)
+
         shapes_edge_attr = get_shape_shards(edge_attr, 0, model_comm_group)
         edge_attr = shard_tensor(edge_attr, 0, shapes_edge_attr, model_comm_group)
-
-        x_src, x_dst, shapes_src, shapes_dst = self.pre_process(x, shard_shapes, model_comm_group)
+        shapes_noise_level_edges = get_shape_shards(noise_level_edges, 0, model_comm_group)
+        noise_level_edges = shard_tensor(noise_level_edges, 0, shapes_noise_level_edges, model_comm_group)
 
         (x_src, x_dst), edge_attr = self.proc(
             (x_src, x_dst),
             edge_attr,
             edge_index,
-            (shapes_src, shapes_dst, shapes_edge_attr),
+            (
+                shapes_src,
+                shapes_dst,
+                shapes_edge_attr,
+            ),  # we don't need noise shapes because they are not used for qkve sharding
+            (noise_level_src, noise_level_dst, noise_level_edges),
             batch_size,
             model_comm_group,
             size=size,
@@ -337,10 +384,11 @@ class GraphTransformerForwardMapper(ForwardMapperPreProcessMixin, GraphTransform
         self,
         x: PairTensor,
         batch_size: int,
-        shard_shapes: tuple[tuple[int], tuple[int]],
+        noise_levels: PairTensor,
+        shard_shapes: tuple[tuple[int], tuple[int], tuple[int], tuple[int]],
         model_comm_group: Optional[ProcessGroup] = None,
     ) -> PairTensor:
-        x_dst = super().forward(x, batch_size, shard_shapes, model_comm_group)
+        x_dst = super().forward(x, batch_size, noise_levels, shard_shapes, model_comm_group)
         return x[0], x_dst
 
 
@@ -408,13 +456,27 @@ class GraphTransformerBackwardMapper(BackwardMapperPostProcessMixin, GraphTransf
             nn.LayerNorm(self.hidden_dim), nn.Linear(self.hidden_dim, self.out_channels_dst)
         )
 
-    def pre_process(self, x, shard_shapes, model_comm_group=None):
-        x_src, x_dst, shapes_src, shapes_dst = super().pre_process(x, shard_shapes, model_comm_group)
+    def pre_process(self, x, noise_levels, shard_shapes, model_comm_group=None):
+        x_src, x_dst, noise_src, noise_dst, noise_edges, shapes_src, shapes_dst, shapes_noise_src, shapes_noise_dst = (
+            super().pre_process(x, noise_levels, shard_shapes, model_comm_group)
+        )
+        noise_src = shard_tensor(noise_src, 0, shapes_noise_src, model_comm_group)
+        noise_dst = shard_tensor(noise_dst, 0, shapes_noise_dst, model_comm_group)
         shapes_src = change_channels_in_shape(shapes_src, self.hidden_dim)
         x_dst = shard_tensor(x_dst, 0, shapes_dst, model_comm_group)
         x_dst = self.emb_nodes_dst(x_dst)
         shapes_dst = change_channels_in_shape(shapes_dst, self.hidden_dim)
-        return x_src, x_dst, shapes_src, shapes_dst
+        return (
+            x_src,
+            x_dst,
+            noise_src,
+            noise_dst,
+            noise_edges,
+            shapes_src,
+            shapes_dst,
+            shapes_noise_src,
+            shapes_noise_dst,
+        )
 
 
 class GNNBaseMapper(GraphEdgeMixin, BaseMapper):

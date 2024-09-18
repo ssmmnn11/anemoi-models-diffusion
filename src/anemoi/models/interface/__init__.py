@@ -9,6 +9,7 @@
 
 import uuid
 from typing import Optional
+from typing import Tuple
 
 import torch
 from anemoi.utils.config import DotDict
@@ -65,6 +66,12 @@ class AnemoiModelInterface(torch.nn.Module):
         self.statistics_tendencies = statistics_tendencies
         self.metadata = metadata
         self.data_indices = data_indices
+
+        # tood : from config
+        self.sigma_max = config.training.noise.sigma_max
+        self.sigma_min = config.training.noise.sigma_min
+        self.sigma_data = config.training.noise.sigma_data
+
         self._build_model()
 
     def _build_model(self) -> None:
@@ -100,13 +107,22 @@ class AnemoiModelInterface(torch.nn.Module):
             _recursive_=False,  # Disables recursive instantiation by Hydra
         )
 
-    def forward(self, x: torch.Tensor, model_comm_group: Optional[ProcessGroup] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        state_in: torch.Tensor,
+        sigma: torch.Tensor,
+        model_comm_group: Optional[ProcessGroup] = None,
+    ) -> torch.Tensor:
         if self.prediction_strategy == "residual":
+
+            assert 1 > 2, "Not implemented, for diffusion model"
+
             # Predict state by adding residual connection (just for the prognostic variables)
             x_pred = self.model.forward(x, model_comm_group)
             x_pred[..., self.model._internal_output_idx] += x[:, -1, :, :, self.model._internal_input_idx]
         else:
-            x_pred = self.model.forward(x, model_comm_group)
+            x_pred = self.model.forward(x, state_in, sigma, model_comm_group)
 
         for bounding in self.model.boundings:
             # bounding performed in the order specified in the config file
@@ -178,3 +194,37 @@ class AnemoiModelInterface(torch.nn.Module):
         ]
 
         return state_outp
+
+    def compute_tendency(self, x_t1, x_t0) -> Tuple[torch.Tensor, torch.Tensor]:
+        tendency = self.pre_processors_tendency(
+            x_t1[..., self.data_indices.data.output.full] - x_t0[..., self.data_indices.data.output.full],
+            in_place=False,
+            data_index=self.data_indices.data.output.full,
+        )
+        # diagnostic variables are taken from x_t1, normalised as full fields:
+        tendency[..., self.data_indices.model.output.diagnostic] = self.pre_processors_state(
+            x_t1[..., self.data_indices.data.output.diagnostic],
+            in_place=False,
+            data_index=self.data_indices.data.output.diagnostic,
+        )
+        return tendency
+
+    def fwd_with_preconditioning(
+        self,
+        x: torch.Tensor,
+        sigma: torch.Tensor,
+        state_in: torch.Tensor,
+        model_comm_group: Optional[ProcessGroup] = None,
+    ) -> torch.Tensor:
+        sigma_data = self.sigma_data
+
+        c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
+        c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
+        c_in = 1.0 / (sigma_data**2 + sigma**2) ** 0.5
+        c_noise = sigma.log() / 4.0  # used to condition on noise levels
+
+        pred = self((c_in * x), state_in, c_noise, model_comm_group=model_comm_group)
+
+        D_x = c_skip * x + c_out * pred
+
+        return D_x
