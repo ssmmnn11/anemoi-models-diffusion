@@ -151,12 +151,14 @@ class TransformerProcessor(BaseProcessor):
         *args,
         **kwargs,
     ) -> Tensor:
-        shape_nodes = change_channels_in_shape(shard_shapes, self.num_channels)
+        shape_nodes, shape_noise = shard_shapes
+        shape_nodes = change_channels_in_shape(shape_nodes, self.num_channels)
         if model_comm_group:
             assert (
                 model_comm_group.size() == 1 or batch_size == 1
             ), "Only batch size of 1 is supported when model is sharded accross GPUs"
 
+        noise_levels = shard_tensor(noise_levels, 0, shape_noise, model_comm_group)
         (x,) = self.run_layers((x,), shape_nodes, noise_levels, batch_size, model_comm_group)
 
         return x
