@@ -89,7 +89,7 @@ class TransformerProcessorBlock(BaseBlock):
         )
 
     def forward(
-        self, x: Tensor, shapes: list, noise_level, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
+        self, x: Tensor, noise_level, shapes: list, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
     ) -> Tensor:
         # Need to be out of place for gradient propagation
         x = x + self.attention(self.layer_norm1(x, noise_level), shapes, batch_size, model_comm_group=model_comm_group)
@@ -568,9 +568,9 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         self,
         x: OptPairTensor,
         edge_attr: Tensor,
+        noise_levels: Tensor,
         edge_index: Adj,
         shapes: tuple,
-        noise_levels: tuple[Tensor],
         batch_size: int,
         model_comm_group: Optional[ProcessGroup] = None,
         size: Optional[Size] = None,
@@ -596,6 +596,6 @@ class GraphTransformerProcessorBlock(GraphTransformerBaseBlock):
         out = self.projection(out + x_r)
 
         out = out + x_skip
-        nodes_new = self.node_dst_mlp(out) + out
+        nodes_new = self.node_dst_mlp(out, noise_levels) + out
 
         return nodes_new, edge_attr

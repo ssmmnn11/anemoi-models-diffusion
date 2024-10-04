@@ -159,7 +159,7 @@ class TransformerProcessor(BaseProcessor):
             ), "Only batch size of 1 is supported when model is sharded accross GPUs"
 
         noise_levels = shard_tensor(noise_levels, 0, shape_noise, model_comm_group)
-        (x,) = self.run_layers((x,), shape_nodes, noise_levels, batch_size, model_comm_group)
+        (x,) = self.run_layers((x,), noise_levels, shape_nodes, batch_size, model_comm_group)
 
         return x
 
@@ -320,21 +320,25 @@ class GraphTransformerProcessor(GraphEdgeMixin, BaseProcessor):
         self,
         x: Tensor,
         batch_size: int,
-        shard_shapes: tuple[tuple[int], tuple[int]],
+        shard_shapes: tuple[tuple[int], ...],
+        noise_levels: Tensor,
         model_comm_group: Optional[ProcessGroup] = None,
         *args,
         **kwargs,
     ) -> Tensor:
-        shape_nodes = change_channels_in_shape(shard_shapes, self.num_channels)
+        shape_nodes, shape_noise = shard_shapes
+        shape_nodes = change_channels_in_shape(shape_nodes, self.num_channels)
         edge_attr = self.trainable(self.edge_attr, batch_size)
 
         edge_index = self._expand_edges(self.edge_index_base, self.edge_inc, batch_size)
 
         shapes_edge_attr = get_shape_shards(edge_attr, 0, model_comm_group)
         edge_attr = shard_tensor(edge_attr, 0, shapes_edge_attr, model_comm_group)
+        noise_levels = shard_tensor(noise_levels, 0, shape_noise, model_comm_group)
 
         x, edge_attr = self.run_layers(
             (x, edge_attr),
+            noise_levels,
             edge_index,
             (shape_nodes, shape_nodes, shapes_edge_attr),
             batch_size,

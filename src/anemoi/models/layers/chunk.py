@@ -105,10 +105,15 @@ class TransformerProcessorChunk(BaseProcessorChunk):
         )
 
     def forward(
-        self, x: Tensor, shapes: list, noise_level, batch_size: int, model_comm_group: Optional[ProcessGroup] = None
+        self,
+        x: Tensor,
+        noise_level: Tensor,
+        shapes: list,
+        batch_size: int,
+        model_comm_group: Optional[ProcessGroup] = None,
     ) -> Tensor:
         for i in range(self.num_layers):
-            x = self.blocks[i](x, shapes, noise_level, batch_size, model_comm_group=model_comm_group)
+            x = self.blocks[i](x, noise_level, shapes, batch_size, model_comm_group=model_comm_group)
 
         return (x,)  # return tuple for consistency with other processors
 
@@ -225,6 +230,7 @@ class GraphTransformerProcessorChunk(BaseProcessorChunk):
         self,
         x: OptPairTensor,
         edge_attr: Tensor,
+        noise_levels: Tensor,
         edge_index: Adj,
         shapes: tuple,
         batch_size: int,
@@ -232,6 +238,8 @@ class GraphTransformerProcessorChunk(BaseProcessorChunk):
         size: Optional[Size] = None,
     ) -> OptPairTensor:
         for i in range(self.num_layers):
-            x, edge_attr = self.blocks[i](x, edge_attr, edge_index, shapes, batch_size, model_comm_group, size=size)
+            x, edge_attr = self.blocks[i](
+                x, edge_attr, noise_levels, edge_index, shapes, batch_size, model_comm_group, size=size
+            )
 
         return x, edge_attr
