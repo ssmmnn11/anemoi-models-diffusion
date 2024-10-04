@@ -6,10 +6,11 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 #
-
+import einops
 import uuid
 from typing import Optional
 from typing import Tuple
+
 
 import torch
 from anemoi.utils.config import DotDict
@@ -153,7 +154,7 @@ class AnemoiModelInterface(torch.nn.Module):
 
             # Dimensions are
             # batch, timesteps, horizontal space, variables
-            x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
+            #x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
             # extra_args = {}
             extra_args = {"S_churn": 2.5, "S_min": 0.75, "S_max": float("inf"), "S_noise": 1.05}
             noise_steps = self.noise_schedule(
@@ -250,10 +251,12 @@ class AnemoiModelInterface(torch.nn.Module):
             gamma = min(S_churn / nsteps, 2 ** (1.0 / 2.0) - 1) if S_min <= t_cur <= S_max else 0
 
             t_hat = t_cur + gamma * t_cur
+            t_hat = t_hat.view(1, 1, 1, 1)
+            t_next = t_next.view(1, 1, 1, 1)
             x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * torch.randn_like(x_cur)
-
+            
             # Euler step.
-            denoised = self.fwd_with_preconditioning(x_hat.to(dtype=x_in.dtype), t_hat.unsqueeze(dim=0).to(x_in.dtype), x_in).to(
+            denoised = self.fwd_with_preconditioning(x_hat.to(dtype=x_in.dtype), t_hat.to(x_in.dtype), x_in).to(
                 dtype
             )
 
@@ -263,7 +266,7 @@ class AnemoiModelInterface(torch.nn.Module):
             # Apply 2nd order correction.
             if i < nsteps - 1:
                 denoised = self.fwd_with_preconditioning(
-                    x_next.to(dtype=x_in.dtype), t_next.unsqueeze(dim=0).to(x_in.dtype), x_in
+                    x_next.to(dtype=x_in.dtype), t_next.to(x_in.dtype), x_in
                 ).to(dtype)
                 d_prime = (x_next - denoised) / t_next
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
@@ -280,7 +283,6 @@ class AnemoiModelInterface(torch.nn.Module):
         model_comm_group: Optional[ProcessGroup] = None,
     ) -> torch.Tensor:
         sigma_data = self.sigma_data
-
         c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
         c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
         c_in = 1.0 / (sigma_data**2 + sigma**2) ** 0.5
