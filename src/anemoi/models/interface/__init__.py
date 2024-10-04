@@ -67,7 +67,6 @@ class AnemoiModelInterface(torch.nn.Module):
         self.metadata = metadata
         self.data_indices = data_indices
 
-        # tood : from config
         self.sigma_max = config.training.noise.sigma_max
         self.sigma_min = config.training.noise.sigma_min
         self.sigma_data = config.training.noise.sigma_data
@@ -155,9 +154,17 @@ class AnemoiModelInterface(torch.nn.Module):
             # batch, timesteps, horizontal space, variables
             x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
             if self.prediction_strategy == "tendency":
-                tendency_hat = self(x)
-                y_hat = self.add_tendency_to_state(x[:, -1, ...], tendency_hat)
+
+                extra_args = {"S_churn": 2.5, "S_min": 0.75, "S_max": 80.0, "S_noise": 1.05}
+                noise_steps = self.noise_schedule(
+                    device=x.device, dtype=torch.float64, nsteps=20, sigma_min=0.03, sigma_max=80, rho=7
+                )
+                tendency_hat = self.default_sampler(x, noise_steps, **extra_args)
+                y_hat = self.add_tendency_to_state(x[:, -1, ...], tendency_hat).to(torch.float32)
             else:
+
+                assert 1 > 2, "Not implemented, for diffusion model"
+
                 y_hat = self(x)
                 y_hat = self.post_processors_state(y_hat, in_place=False)
 
@@ -228,3 +235,58 @@ class AnemoiModelInterface(torch.nn.Module):
         D_x = c_skip * x + c_out * pred
 
         return D_x
+
+    def noise_schedule(self, device, dtype=None, nsteps=20, sigma_min=0.03, sigma_max=80, rho=7):
+        if dtype is None:
+            steps_idx = torch.arange(nsteps, device=device)
+        else:
+            steps_idx = torch.arange(nsteps, device=device, dtype=dtype)
+        noise_steps = (
+            sigma_max ** (1 / rho) + steps_idx / (nsteps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))
+        ) ** rho
+        noise_steps = torch.cat([torch.as_tensor(noise_steps), torch.zeros_like(noise_steps[:1])])
+
+        return noise_steps
+
+    def default_sampler(
+        self,
+        x_in: torch.Tensor,
+        noise_steps,
+        S_churn=0,
+        S_min=0,
+        S_max=float("inf"),
+        S_noise=1.0,
+        dtype=torch.float64,
+    ):
+        batch_size = x_in.shape[0]
+        assert batch_size == 1, "need to adapt for bs > 1 ? to test ..."
+
+        nsteps = len(noise_steps) - 1
+        x_next = torch.randn_like(x_in[:, 0, ..., : self.model.num_output_channels]) * noise_steps[0]
+
+        for i, (t_cur, t_next) in enumerate(zip(noise_steps[:-1], noise_steps[1:])):  # 0, ..., N-1
+            x_cur = x_next
+
+            # Increase noise temporarily.
+            gamma = min(S_churn / nsteps, 2 ** (1.0 / 2.0) - 1) if S_min <= t_cur <= S_max else 0
+
+            t_hat = t_cur + gamma * t_cur
+            x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * torch.randn_like(x_cur)
+
+            # Euler step.
+            denoised = self.fwd_with_preconditioning(
+                x_hat.to(dtype=x_in.dtype), t_hat.unsqueeze(dim=0).to(x_in.dtype), x_in
+            ).to(dtype)
+
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
+
+            # Apply 2nd order correction.
+            if i < nsteps - 1:
+                denoised = self.fwd_with_preconditioning(
+                    x_next.to(dtype=x_in.dtype), t_next.unsqueeze(dim=0).to(x_in.dtype), x_in
+                ).to(dtype)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+        return x_next
