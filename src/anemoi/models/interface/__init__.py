@@ -6,10 +6,11 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 #
-
+import einops
 import uuid
 from typing import Optional
 from typing import Tuple
+
 
 import torch
 from anemoi.utils.config import DotDict
@@ -130,7 +131,7 @@ class AnemoiModelInterface(torch.nn.Module):
 
         return x_pred
 
-    def predict_step(self, batch: torch.Tensor) -> torch.Tensor:
+    def predict_step(self, batch: torch.Tensor, fcstep: int = 0, plot_diag: bool = False) -> torch.Tensor:
         """Prediction step for the model.
 
         Parameters
@@ -146,16 +147,22 @@ class AnemoiModelInterface(torch.nn.Module):
 
         with torch.no_grad():
 
-            assert (
-                len(batch.shape) == 4
-            ), f"The input tensor has an incorrect shape: expected a 4-dimensional tensor, got {batch.shape}!"
+            # assert (
+            #     len(batch.shape) == 1
+            # ), f"The input tensor has an incorrect shape: expected a 4-dimensional tensor, got {batch.shape}!"
             x = self.pre_processors_state(batch[:, 0 : self.multi_step, ...], in_place=False)
 
             # Dimensions are
             # batch, timesteps, horizontal space, variables
-            x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
+            #x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
+            # extra_args = {}
+            extra_args = {"S_churn": 2.5, "S_min": 0.75, "S_max": float("inf"), "S_noise": 1.05}
+            noise_steps = self.noise_schedule(
+                device=x.device, dtype=torch.float64, nsteps=20, sigma_min=0.002, sigma_max=80, rho=7
+            )
+            
             if self.prediction_strategy == "tendency":
-                tendency_hat = self(x)
+                tendency_hat = self.default_sampler(x, noise_steps, plot_diag=plot_diag, **extra_args)
                 y_hat = self.add_tendency_to_state(x[:, -1, ...], tendency_hat)
             else:
                 y_hat = self(x)
@@ -209,6 +216,65 @@ class AnemoiModelInterface(torch.nn.Module):
         )
         return tendency
 
+
+    def noise_schedule(self, device, dtype=None, nsteps=20, sigma_min=0.002, sigma_max=80, rho=7):
+        if dtype is None:
+            steps_idx = torch.arange(nsteps, device=device)
+        else:
+            steps_idx = torch.arange(nsteps, device=device, dtype=dtype)
+        noise_steps = (sigma_max ** (1 / rho) + steps_idx / (nsteps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        noise_steps = torch.cat([torch.as_tensor(noise_steps), torch.zeros_like(noise_steps[:1])])
+
+        return noise_steps
+    
+    def default_sampler(
+        self,
+        x_in,
+        noise_steps,
+        plot_diag=False,
+        S_churn=0,  # 2.5
+        S_min=0,  # 0.75
+        S_max=float("inf"),
+        S_noise=1.0,  # 1,  # 1.05
+        dtype=torch.float64,
+    ):
+        batch_size = x_in.shape[0]
+        assert batch_size == 1, "need to adapt for bs > 1 ?"
+
+        nsteps = len(noise_steps) - 1
+        x_next = torch.randn_like(x_in[:, 0, ..., : self.model.num_output_channels]) * noise_steps[0]
+
+        for i, (t_cur, t_next) in enumerate(zip(noise_steps[:-1], noise_steps[1:])):  # 0, ..., N-1
+            x_cur = x_next
+
+            # Increase noise temporarily.
+            gamma = min(S_churn / nsteps, 2 ** (1.0 / 2.0) - 1) if S_min <= t_cur <= S_max else 0
+
+            t_hat = t_cur + gamma * t_cur
+            t_hat = t_hat.view(1, 1, 1, 1)
+            t_next = t_next.view(1, 1, 1, 1)
+            x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * torch.randn_like(x_cur)
+            
+            # Euler step.
+            denoised = self.fwd_with_preconditioning(x_hat.to(dtype=x_in.dtype), t_hat.to(x_in.dtype), x_in).to(
+                dtype
+            )
+
+            d_cur = (x_hat - denoised) / t_hat
+            x_next = x_hat + (t_next - t_hat) * d_cur
+
+            # Apply 2nd order correction.
+            if i < nsteps - 1:
+                denoised = self.fwd_with_preconditioning(
+                    x_next.to(dtype=x_in.dtype), t_next.to(x_in.dtype), x_in
+                ).to(dtype)
+                d_prime = (x_next - denoised) / t_next
+                x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
+
+            if plot_diag:
+                self._plot_denoising(denoised, x_next, i)
+
+        return x_next
     def fwd_with_preconditioning(
         self,
         x: torch.Tensor,
@@ -217,7 +283,6 @@ class AnemoiModelInterface(torch.nn.Module):
         model_comm_group: Optional[ProcessGroup] = None,
     ) -> torch.Tensor:
         sigma_data = self.sigma_data
-
         c_skip = sigma_data**2 / (sigma**2 + sigma_data**2)
         c_out = sigma * sigma_data / (sigma**2 + sigma_data**2) ** 0.5
         c_in = 1.0 / (sigma_data**2 + sigma**2) ** 0.5
