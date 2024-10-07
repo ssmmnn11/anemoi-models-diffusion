@@ -129,13 +129,15 @@ class AnemoiModelInterface(torch.nn.Module):
 
         return x_pred
 
-    def predict_step(self, batch: torch.Tensor) -> torch.Tensor:
+    def predict_step(self, batch: torch.Tensor, from_trainer=False) -> torch.Tensor:
         """Prediction step for the model.
 
         Parameters
         ----------
         batch : torch.Tensor
             Input batched data.
+        from_trainer: bool
+            Whether predict_step is called from lightining trainer.
 
         Returns
         -------
@@ -145,17 +147,29 @@ class AnemoiModelInterface(torch.nn.Module):
 
         with torch.no_grad():
 
-            assert (
-                len(batch.shape) == 4
-            ), f"The input tensor has an incorrect shape: expected a 4-dimensional tensor, got {batch.shape}!"
-            x = self.pre_processors_state(batch[:, 0 : self.multi_step, ...], in_place=False)
+            # x = batch[:, 0 : self.multi_step, ...]
+            x = batch[
+                :, 0 : self.multi_step, ..., self.data_indices.data.input.full
+            ]  # why is this needed???? Removes one variable
 
-            # Dimensions are
-            # batch, timesteps, horizontal space, variables
-            x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
+            if not from_trainer:
+                assert (
+                    len(x.shape) == 4
+                ), f"The input tensor has an incorrect shape: expected a 4-dimensional tensor, got {batch.shape}!"
+                # Dimensions are
+                # batch, timesteps, horizontal space, variables
+                x = x[..., None, :, :]  # add dummy ensemble dimension as 3rd index
+
+            x = self.pre_processors_state(x, in_place=False)
+
             if self.prediction_strategy == "tendency":
 
-                extra_args = {"S_churn": 2.5, "S_min": 0.75, "S_max": 80.0, "S_noise": 1.05}
+                extra_args = {
+                    "S_churn": 2.5,
+                    "S_min": 0.75,
+                    "S_max": 80.0,
+                    "S_noise": 1.05,
+                }  # needs to be configurable ....
                 noise_steps = self.noise_schedule(
                     device=x.device, dtype=torch.float64, nsteps=20, sigma_min=0.03, sigma_max=80, rho=7
                 )
@@ -259,23 +273,28 @@ class AnemoiModelInterface(torch.nn.Module):
         dtype=torch.float64,
     ):
         batch_size = x_in.shape[0]
-        assert batch_size == 1, "need to adapt for bs > 1 ? to test ..."
+        ensemble_size = x_in.shape[2]
 
         nsteps = len(noise_steps) - 1
         x_next = torch.randn_like(x_in[:, 0, ..., : self.model.num_output_channels]) * noise_steps[0]
+
+        t_shape = torch.ones(
+            [batch_size, ensemble_size] + [1 for x in x_next.shape[2:]],
+            dtype=noise_steps.dtype,
+            device=noise_steps.device,
+        )  # should be : bs, ensemble size, latlon, nvar
 
         for i, (t_cur, t_next) in enumerate(zip(noise_steps[:-1], noise_steps[1:])):  # 0, ..., N-1
             x_cur = x_next
 
             # Increase noise temporarily.
             gamma = min(S_churn / nsteps, 2 ** (1.0 / 2.0) - 1) if S_min <= t_cur <= S_max else 0
-
             t_hat = t_cur + gamma * t_cur
             x_hat = x_cur + (t_hat**2 - t_cur**2).sqrt() * S_noise * torch.randn_like(x_cur)
 
             # Euler step.
             denoised = self.fwd_with_preconditioning(
-                x_hat.to(dtype=x_in.dtype), t_hat.unsqueeze(dim=0).to(x_in.dtype), x_in
+                x_hat.to(dtype=x_in.dtype), (t_hat * t_shape).to(x_in.dtype), x_in
             ).to(dtype)
 
             d_cur = (x_hat - denoised) / t_hat
@@ -284,7 +303,7 @@ class AnemoiModelInterface(torch.nn.Module):
             # Apply 2nd order correction.
             if i < nsteps - 1:
                 denoised = self.fwd_with_preconditioning(
-                    x_next.to(dtype=x_in.dtype), t_next.unsqueeze(dim=0).to(x_in.dtype), x_in
+                    x_next.to(dtype=x_in.dtype), (t_next * t_shape).to(x_in.dtype), x_in
                 ).to(dtype)
                 d_prime = (x_next - denoised) / t_next
                 x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
