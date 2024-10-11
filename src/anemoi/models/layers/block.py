@@ -29,6 +29,7 @@ from anemoi.models.layers.attention import MultiHeadSelfAttention
 from anemoi.models.layers.conv import GraphConv
 from anemoi.models.layers.conv import GraphTransformerConv
 from anemoi.models.layers.mlp import MLP
+from anemoi.models.layers.utils import AutocastLayerNorm
 from anemoi.models.layers.utils import ConditionalLayerNorm
 
 LOGGER = logging.getLogger(__name__)
@@ -328,6 +329,9 @@ class GraphTransformerBaseBlock(BaseBlock, ABC):
         self.lin_self = nn.Linear(in_channels, num_heads * self.out_channels_conv, bias=bias)
         self.lin_edge = nn.Linear(edge_dim, num_heads * self.out_channels_conv)  # , bias=False)
 
+        self.q_norm = AutocastLayerNorm(self.out_channels_conv, bias=False)
+        self.k_norm = AutocastLayerNorm(self.out_channels_conv, bias=False)
+
         self.conv = GraphTransformerConv(out_channels=self.out_channels_conv)
 
         self.projection = nn.Linear(out_channels, out_channels)
@@ -499,6 +503,11 @@ class GraphTransformerMapperBlock(GraphTransformerBaseBlock):
             ), "Only batch size of 1 is supported when model is sharded across GPUs"
 
         query, key, value, edges = self.shard_qkve_heads(query, key, value, edges, shapes, batch_size, model_comm_group)
+
+        # qk normalization
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+
         out = self.conv(query=query, key=key, value=value, edge_attr=edges, edge_index=edge_index, size=size)
         out = self.shard_output_seq(out, shapes, batch_size, model_comm_group)
         out = self.projection(out + x_r)

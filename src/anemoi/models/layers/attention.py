@@ -26,6 +26,7 @@ else:
 
 from anemoi.models.distributed.transformer import shard_heads
 from anemoi.models.distributed.transformer import shard_sequence
+from anemoi.models.layers.utils import AutocastLayerNorm
 
 LOGGER = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ class MultiHeadSelfAttention(nn.Module):
         self.lin_qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.attention = attn_func
 
+        self.q_norm = AutocastLayerNorm(self.head_dim, bias=False)
+        self.k_norm = AutocastLayerNorm(self.head_dim, bias=False)
+
         if not _FLASH_ATTENTION_AVAILABLE:
             LOGGER.warning("Flash attention not available, falling back to pytorch scaled_dot_product_attention")
 
@@ -87,6 +91,9 @@ class MultiHeadSelfAttention(nn.Module):
         key = shard_heads(key, shapes=shapes, mgroup=model_comm_group)
         value = shard_heads(value, shapes=shapes, mgroup=model_comm_group)
         dropout_p = self.dropout_p if self.training else 0.0
+        # qk normalization
+        query = self.q_norm(query)
+        key = self.k_norm(key)
 
         if _FLASH_ATTENTION_AVAILABLE:
             query, key, value = (
