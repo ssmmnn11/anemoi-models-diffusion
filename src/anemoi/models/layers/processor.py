@@ -39,6 +39,7 @@ class BaseProcessor(nn.Module, ABC):
         num_chunks: int = 2,
         activation: str = "GELU",
         cpu_offload: bool = False,
+        grad_checkpointing: bool = True,
         **kwargs,
     ) -> None:
         """Initialize BaseProcessor."""
@@ -48,6 +49,7 @@ class BaseProcessor(nn.Module, ABC):
         self.num_chunks = num_chunks
         self.num_channels = num_channels
         self.chunk_size = num_layers // num_chunks
+        self.use_grad_checkpoint = grad_checkpointing
 
         assert (
             num_layers % num_chunks == 0
@@ -72,7 +74,10 @@ class BaseProcessor(nn.Module, ABC):
     def run_layers(self, data: tuple, *args, **kwargs) -> Tensor:
         """Run Layers with checkpoint."""
         for layer in self.proc:
-            data = checkpoint(layer, *data, *args, **kwargs, use_reentrant=False)
+            if self.use_grad_checkpoint:
+                data = checkpoint(layer, *data, *args, **kwargs, use_reentrant=False)
+            else:
+                data = layer(*data, *args, **kwargs)
         return data
 
     def forward(self, x: Tensor, *args, **kwargs) -> Tensor:
@@ -93,6 +98,7 @@ class TransformerProcessor(BaseProcessor):
         num_chunks: int = 2,
         activation: str = "GELU",
         cpu_offload: bool = False,
+        grad_checkpointing: bool = True,
         num_heads: int = 16,
         mlp_hidden_ratio: int = 4,
         dropout_p: float = 0.1,
@@ -126,6 +132,7 @@ class TransformerProcessor(BaseProcessor):
             cpu_offload=cpu_offload,
             num_heads=num_heads,
             mlp_hidden_ratio=mlp_hidden_ratio,
+            grad_checkpointing=grad_checkpointing,
         )
 
         self.build_layers(
@@ -177,6 +184,7 @@ class GNNProcessor(GraphEdgeMixin, BaseProcessor):
         mlp_extra_layers: int = 0,
         activation: str = "SiLU",
         cpu_offload: bool = False,
+        grad_checkpointing: bool = True,
         sub_graph: Optional[HeteroData] = None,
         sub_graph_edge_attributes: Optional[list[str]] = None,
         src_grid_size: int = 0,
@@ -207,6 +215,7 @@ class GNNProcessor(GraphEdgeMixin, BaseProcessor):
             activation=activation,
             cpu_offload=cpu_offload,
             mlp_extra_layers=mlp_extra_layers,
+            grad_checkpointing=grad_checkpointing,
         )
 
         self._register_edges(sub_graph, sub_graph_edge_attributes, src_grid_size, dst_grid_size, trainable_size)
@@ -265,6 +274,7 @@ class GraphTransformerProcessor(GraphEdgeMixin, BaseProcessor):
         mlp_hidden_ratio: int = 4,
         activation: str = "GELU",
         cpu_offload: bool = False,
+        grad_checkpointing: bool = True,
         sub_graph: Optional[HeteroData] = None,
         sub_graph_edge_attributes: Optional[list[str]] = None,
         src_grid_size: int = 0,
@@ -298,6 +308,7 @@ class GraphTransformerProcessor(GraphEdgeMixin, BaseProcessor):
             cpu_offload=cpu_offload,
             num_heads=num_heads,
             mlp_hidden_ratio=mlp_hidden_ratio,
+            grad_checkpointing=grad_checkpointing,
         )
 
         self._register_edges(sub_graph, sub_graph_edge_attributes, src_grid_size, dst_grid_size, trainable_size)

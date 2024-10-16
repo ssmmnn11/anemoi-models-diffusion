@@ -60,6 +60,9 @@ class AnemoiModelEncProcDec(nn.Module):
 
         self.multi_step = model_config.training.multistep_input
 
+        self.encoder_grad_checkpointing = model_config.model.encoder_grad_checkpointing
+        self.decoder_grad_checkpointing = model_config.model.decoder_grad_checkpointing
+
         self._define_tensor_sizes(model_config)
 
         # Create trainable tensors
@@ -181,6 +184,7 @@ class AnemoiModelEncProcDec(nn.Module):
         batch_size: int,
         shard_shapes: tuple[tuple[int, int], tuple[int, int]],
         model_comm_group: Optional[ProcessGroup] = None,
+        use_grad_checkpoint: bool = False,
         use_reentrant: bool = False,
     ) -> Tensor:
         """Run mapper with activation checkpoint.
@@ -191,6 +195,8 @@ class AnemoiModelEncProcDec(nn.Module):
             Which processor to use
         data : tuple[Tensor]
             tuple of data to pass in
+        noise_levels : tuple[Tensor],
+            tuple of noise levels
         batch_size: int,
             Batch size
         shard_shapes : tuple[tuple[int, int], tuple[int, int]]
@@ -198,6 +204,8 @@ class AnemoiModelEncProcDec(nn.Module):
         model_comm_group : ProcessGroup
             model communication group, specifies which GPUs work together
             in one model instance
+        use_grad_checkpoint : bool, optional
+            Use gradient checkpointing, by default False
         use_reentrant : bool, optional
             Use reentrant, by default False
 
@@ -206,15 +214,24 @@ class AnemoiModelEncProcDec(nn.Module):
         Tensor
             Mapped data
         """
-        return checkpoint(
-            mapper,
-            data,
-            batch_size=batch_size,
-            noise_levels=noise_levels,
-            shard_shapes=shard_shapes,
-            model_comm_group=model_comm_group,
-            use_reentrant=use_reentrant,
-        )
+        if use_grad_checkpoint:
+            return checkpoint(
+                mapper,
+                data,
+                batch_size=batch_size,
+                noise_levels=noise_levels,
+                shard_shapes=shard_shapes,
+                model_comm_group=model_comm_group,
+                use_reentrant=use_reentrant,
+            )
+        else:
+            return mapper(
+                data,
+                batch_size=batch_size,
+                noise_levels=noise_levels,
+                shard_shapes=shard_shapes,
+                model_comm_group=model_comm_group,
+            )
 
     def make_noise_emb(self, noise_emb: Tensor, repeat: int) -> Tensor:
         out = einops.repeat(
@@ -278,6 +295,7 @@ class AnemoiModelEncProcDec(nn.Module):
             batch_size=batch_size,
             shard_shapes=(shard_shapes_data, shard_shapes_hidden, shape_noise_data, shape_noise_hidden),
             model_comm_group=model_comm_group,
+            use_grad_checkpoint=self.encoder_grad_checkpointing,
         )
 
         x_latent_proc = self.processor(
@@ -299,6 +317,7 @@ class AnemoiModelEncProcDec(nn.Module):
             batch_size=batch_size,
             shard_shapes=(shard_shapes_hidden, shard_shapes_data, shape_noise_hidden, shape_noise_data),
             model_comm_group=model_comm_group,
+            use_grad_checkpoint=self.decoder_grad_checkpointing,
         )
 
         x_out = (
